@@ -1,0 +1,488 @@
+{
+  "name": "AutoGenie – Google Maps leads → Telegram",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "channel_post"
+        ],
+        "additionalFields": {}
+      },
+      "id": "b4564801-b588-4d48-afb5-7bef5fec6e98",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "314384da-4c01-400e-bc93-5d662f21bfc8",
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "380bcf33-8964-47c6-b211-d41b7aa40d4b",
+      "name": "Schedule Trigger (weekdays 09:00)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared command parser (kept identical in both parser nodes) ----\nconst HELP = [\n  '<b>🤖 AutoGenie lead bot</b>',\n  '',\n  '<b>Usage</b>',\n  '<code>/leads plumbers in Chicago, IL</code>',\n  '<code>/leads dentists | Austin, TX --limit 30 --no-website</code>',\n  '',\n  '<b>Flags</b>',\n  '<code>--limit N</code>  number of NEW leads (default ' + ($env.DEFAULT_LEAD_LIMIT || 20) + ', max 100)',\n  '<code>--phone</code>  only leads with a phone number',\n  '<code>--has-website</code> / <code>--no-website</code>',\n  '<code>--min-rating 4.2</code>   <code>--max-rating 4</code>   <code>--min-reviews 10</code>',\n  '<code>--emails</code>  look for emails on their websites (slower)',\n  '<code>--all</code>  include leads that were already sent before',\n  '',\n  'Leads already delivered are skipped automatically, so you can repeat a search to get fresh ones.',\n].join('\\n');\n\nfunction escapeHtml(s) {\n  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction parseJob(input, defaultLimit) {\n  let text = ' ' + String(input || '').replace(/[–—]{1}/g, '--') + ' ';\n  const filters = {};\n  let limit = defaultLimit, emails = false, all = false;\n\n  const num = (re) => {\n    const m = text.match(re);\n    if (!m) return null;\n    text = text.replace(m[0], ' ');\n    return Number(m[1]);\n  };\n  const flag = (re) => {\n    if (!re.test(text)) return false;\n    text = text.replace(re, ' ');\n    return true;\n  };\n\n  const l = num(/\\s(?:--limit|-n)\\s*=?\\s*(\\d+)/i);            if (l) limit = l;\n  const minR = num(/\\s--min-rating\\s*=?\\s*([\\d.]+)/i);        if (minR != null) filters.min_rating = minR;\n  const maxR = num(/\\s--max-rating\\s*=?\\s*([\\d.]+)/i);        if (maxR != null) filters.max_rating = maxR;\n  const minRev = num(/\\s--min-reviews\\s*=?\\s*(\\d+)/i);        if (minRev != null) filters.min_reviews = minRev;\n  if (flag(/\\s--no-website(?=\\s)/i)) filters.without_website = true;\n  if (flag(/\\s--has-website(?=\\s)/i)) filters.require_website = true;\n  if (flag(/\\s--phone(?=\\s)/i)) filters.require_phone = true;\n  if (flag(/\\s--closed(?=\\s)/i)) filters.include_closed = true;\n  if (flag(/\\s--emails?(?=\\s)/i)) emails = true;\n  if (flag(/\\s--all(?=\\s)/i)) all = true;\n\n  const unknown = text.match(/\\s(--?[a-z][\\w-]*)/i);\n  if (unknown) return { error: 'Unknown flag: <code>' + escapeHtml(unknown[1]) + '</code>' };\n  if (filters.without_website && filters.require_website)\n    return { error: '--no-website and --has-website cannot be combined.' };\n\n  text = text.replace(/\\s+/g, ' ').trim();\n  let niche = text, location = null;\n  if (text.includes('|')) {\n    [niche, location] = text.split('|').map((s) => s.trim());\n  } else {\n    const m = text.match(/^(.+)\\s+(?:in|near|around)\\s+(.+)$/i);\n    if (m) { niche = m[1].trim(); location = m[2].trim(); }\n  }\n  if (!niche || niche.length < 2)\n    return { error: 'Please tell me what to search, e.g. <code>/leads plumbers in Chicago</code>' };\n\n  limit = Math.max(1, Math.min(Math.floor(limit) || defaultLimit, 100));\n  const search = location ? niche + ' in ' + location : niche;\n  return {\n    search,\n    request: {\n      query: niche,\n      location: location || null,\n      limit,\n      filters,\n      exclude_seen: !all,\n      mark_seen: true,\n      enrich_emails: emails,\n    },\n  };\n}\n// ---- end shared parser ----\n\nconst allowed = String($env.TELEGRAM_ALLOWED_CHAT_IDS || '')\n  .split(',').map((s) => s.trim()).filter(Boolean);\nconst defaultLimit = parseInt($env.DEFAULT_LEAD_LIMIT || '20', 10) || 20;\nconst out = [];\n\nfor (const item of $input.all()) {\n  const msg = item.json.message || item.json.channel_post;\n  if (!msg || typeof msg.text !== 'string') continue;\n\n  const chatId = String(msg.chat.id);\n  const fromId = msg.from ? String(msg.from.id) : '';\n  // Silently ignore anyone who is not on the allow-list.\n  if (allowed.length && !allowed.includes(chatId) && !allowed.includes(fromId)) continue;\n\n  const m = msg.text.trim().match(/^\\/(\\w+)(?:@\\w+)?\\s*([\\s\\S]*)$/);\n  if (!m) continue; // plain chat, not a command\n  const cmd = m[1].toLowerCase();\n  const args = m[2];\n\n  if (['leads', 'lead', 'scrape'].includes(cmd)) {\n    if (!args.trim()) { out.push({ json: { valid: false, chatId, reply: HELP } }); continue; }\n    const job = parseJob(args, defaultLimit);\n    if (job.error) { out.push({ json: { valid: false, chatId, reply: '⚠️ ' + job.error + '\\n\\n' + HELP } }); continue; }\n    const who = msg.from ? (msg.from.username ? '@' + msg.from.username : msg.from.first_name) : 'channel';\n    job.request.meta = { chat_id: chatId, source: 'telegram', requested_by: who };\n    out.push({ json: {\n      valid: true, chatId, search: job.search, request: job.request,\n      ack: '🔎 Searching Google Maps for <b>' + escapeHtml(job.search) + '</b> (up to ' + job.request.limit +\n           ' new leads' + (job.request.enrich_emails ? ', with email lookup' : '') + ')…\\nThis usually takes 1–5 minutes.',\n    } });\n  } else if (['start', 'help'].includes(cmd)) {\n    out.push({ json: { valid: false, chatId, reply: HELP } });\n  }\n}\nreturn out;\n"
+      },
+      "id": "147f3f71-9c8e-4e3c-b2c4-3dc6b504a122",
+      "name": "Parse Telegram command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- shared command parser (kept identical in both parser nodes) ----\nconst HELP = [\n  '<b>🤖 AutoGenie lead bot</b>',\n  '',\n  '<b>Usage</b>',\n  '<code>/leads plumbers in Chicago, IL</code>',\n  '<code>/leads dentists | Austin, TX --limit 30 --no-website</code>',\n  '',\n  '<b>Flags</b>',\n  '<code>--limit N</code>  number of NEW leads (default ' + ($env.DEFAULT_LEAD_LIMIT || 20) + ', max 100)',\n  '<code>--phone</code>  only leads with a phone number',\n  '<code>--has-website</code> / <code>--no-website</code>',\n  '<code>--min-rating 4.2</code>   <code>--max-rating 4</code>   <code>--min-reviews 10</code>',\n  '<code>--emails</code>  look for emails on their websites (slower)',\n  '<code>--all</code>  include leads that were already sent before',\n  '',\n  'Leads already delivered are skipped automatically, so you can repeat a search to get fresh ones.',\n].join('\\n');\n\nfunction escapeHtml(s) {\n  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\n}\n\nfunction parseJob(input, defaultLimit) {\n  let text = ' ' + String(input || '').replace(/[–—]{1}/g, '--') + ' ';\n  const filters = {};\n  let limit = defaultLimit, emails = false, all = false;\n\n  const num = (re) => {\n    const m = text.match(re);\n    if (!m) return null;\n    text = text.replace(m[0], ' ');\n    return Number(m[1]);\n  };\n  const flag = (re) => {\n    if (!re.test(text)) return false;\n    text = text.replace(re, ' ');\n    return true;\n  };\n\n  const l = num(/\\s(?:--limit|-n)\\s*=?\\s*(\\d+)/i);            if (l) limit = l;\n  const minR = num(/\\s--min-rating\\s*=?\\s*([\\d.]+)/i);        if (minR != null) filters.min_rating = minR;\n  const maxR = num(/\\s--max-rating\\s*=?\\s*([\\d.]+)/i);        if (maxR != null) filters.max_rating = maxR;\n  const minRev = num(/\\s--min-reviews\\s*=?\\s*(\\d+)/i);        if (minRev != null) filters.min_reviews = minRev;\n  if (flag(/\\s--no-website(?=\\s)/i)) filters.without_website = true;\n  if (flag(/\\s--has-website(?=\\s)/i)) filters.require_website = true;\n  if (flag(/\\s--phone(?=\\s)/i)) filters.require_phone = true;\n  if (flag(/\\s--closed(?=\\s)/i)) filters.include_closed = true;\n  if (flag(/\\s--emails?(?=\\s)/i)) emails = true;\n  if (flag(/\\s--all(?=\\s)/i)) all = true;\n\n  const unknown = text.match(/\\s(--?[a-z][\\w-]*)/i);\n  if (unknown) return { error: 'Unknown flag: <code>' + escapeHtml(unknown[1]) + '</code>' };\n  if (filters.without_website && filters.require_website)\n    return { error: '--no-website and --has-website cannot be combined.' };\n\n  text = text.replace(/\\s+/g, ' ').trim();\n  let niche = text, location = null;\n  if (text.includes('|')) {\n    [niche, location] = text.split('|').map((s) => s.trim());\n  } else {\n    const m = text.match(/^(.+)\\s+(?:in|near|around)\\s+(.+)$/i);\n    if (m) { niche = m[1].trim(); location = m[2].trim(); }\n  }\n  if (!niche || niche.length < 2)\n    return { error: 'Please tell me what to search, e.g. <code>/leads plumbers in Chicago</code>' };\n\n  limit = Math.max(1, Math.min(Math.floor(limit) || defaultLimit, 100));\n  const search = location ? niche + ' in ' + location : niche;\n  return {\n    search,\n    request: {\n      query: niche,\n      location: location || null,\n      limit,\n      filters,\n      exclude_seen: !all,\n      mark_seen: true,\n      enrich_emails: emails,\n    },\n  };\n}\n// ---- end shared parser ----\n\nconst chatId = String($env.SCHEDULE_CHAT_ID || '').trim();\nif (!chatId) throw new Error('SCHEDULE_CHAT_ID is not set in .env');\nconst defaultLimit = parseInt($env.DEFAULT_LEAD_LIMIT || '20', 10) || 20;\n\n// SCHEDULED_JOBS format:  niche | location | limit | flags ; niche | location ...\nconst lines = String($env.SCHEDULED_JOBS || '').split(';').map((s) => s.trim()).filter(Boolean);\nif (!lines.length) throw new Error('SCHEDULED_JOBS is empty in .env');\n\nreturn lines.map((line) => {\n  const [niche = '', location = '', limit = '', flags = ''] = line.split('|').map((s) => s.trim());\n  const args = niche + (location ? ' | ' + location : '') + (limit ? ' --limit ' + limit : '') + ' ' + flags;\n  const job = parseJob(args, defaultLimit);\n  if (job.error) {\n    return { json: { valid: false, chatId, reply: '⚠️ Bad scheduled job \"' + escapeHtml(line) + '\": ' + job.error } };\n  }\n  job.request.meta = { chat_id: chatId, source: 'schedule', requested_by: 'schedule' };\n  return { json: {\n    valid: true, chatId, search: job.search, request: job.request,\n    ack: '⏰ Scheduled run: <b>' + escapeHtml(job.search) + '</b> (up to ' + job.request.limit + ' new leads)…',\n  } };\n});\n"
+      },
+      "id": "9ab3f864-82fa-40e0-9448-eb3b1cf758b1",
+      "name": "Build scheduled jobs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b3b1e933-48e3-4aaf-adf3-7ba9f45448b0",
+              "leftValue": "={{ $json.valid }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6a492a0c-b0b1-44f6-a0d4-17ef69039edd",
+      "name": "Valid request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.ack }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "81591301-c3da-4eb3-ab42-dfa02373cc28",
+      "name": "Send 'searching' message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        0
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.reply }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "a427008f-cf83-45f0-9856-dd49844f2757",
+      "name": "Reply with help / error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        720,
+        260
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.SCRAPER_URL || 'http://scraper:8000') + '/scrape' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.SCRAPER_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Valid request?').item.json.request) }}",
+        "options": {
+          "timeout": 900000,
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2000
+            }
+          }
+        }
+      },
+      "id": "bedf8cc1-afd7-4ce9-9af2-167906ef9742",
+      "name": "Scrape Google Maps",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Final clean / dedupe / format pass. The scraper already normalises and\n// dedupes against history; this is a safety net + Telegram formatting.\nconst esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst MAX_LEN = 3800; // Telegram hard limit is 4096 chars per message\nconst out = [];\n\nfor (const item of $input.all()) {\n  const r = item.json;\n  const chatId = r.meta && r.meta.chat_id;\n  if (!chatId) continue;\n\n  const seen = new Set();\n  const leads = [];\n  for (const l of r.leads || []) {\n    if (!l || !l.name) continue;\n    const keys = [l.lead_key, l.phone_digits && 'p:' + l.phone_digits,\n                  'n:' + l.name.toLowerCase().replace(/[^a-z0-9]/g, '') + '|' + (l.address || '').toLowerCase().replace(/[^a-z0-9]/g, '')]\n                 .filter(Boolean);\n    if (keys.some((k) => seen.has(k))) continue;\n    keys.forEach((k) => seen.add(k));\n    leads.push(l);\n  }\n\n  const s = r.stats || {};\n  const filtered = Object.values(s.filtered || {}).reduce((a, b) => a + b, 0);\n  const skipped = (s.skipped_seen || 0) + (s.skipped_duplicate || 0);\n  let summary =\n    '<b>📊 ' + esc(r.search) + '</b>\\n' +\n    '✅ <b>' + leads.length + '</b> new lead(s)\\n' +\n    '🔁 ' + skipped + ' already sent / duplicate\\n' +\n    '🧹 ' + filtered + ' filtered out\\n' +\n    '⏱ ' + (s.duration_s ?? '?') + 's';\n  if (!leads.length) {\n    summary += '\\n\\nNo new leads matched. Try a nearby location, loosen the filters, or add <code>--all</code>.';\n  }\n  out.push({ json: { chatId, text: summary } });\n\n  let chunk = '';\n  leads.forEach((l, i) => {\n    const lines = ['<b>' + (i + 1) + '. ' + esc(l.name) + '</b>'];\n    const info = [];\n    if (l.rating != null) info.push('⭐ ' + l.rating + (l.reviews != null ? ' (' + l.reviews + ')' : ''));\n    if (l.category) info.push(esc(l.category));\n    if (info.length) lines.push(info.join(' · '));\n    if (l.phone) lines.push('📞 <code>' + esc(l.phone) + '</code>');\n    lines.push(l.website\n      ? '🌐 <a href=\"' + esc(l.website) + '\">' + esc(l.domain || l.website) + '</a>'\n      : '🌐 <i>No website</i>');\n    if (l.emails && l.emails.length) lines.push('✉️ ' + l.emails.map(esc).join(', '));\n    if (l.address) lines.push('📍 ' + esc(l.address));\n    if (l.maps_url) lines.push('🗺 <a href=\"' + esc(l.maps_url) + '\">Open in Google Maps</a>');\n    if (l.temporarily_closed) lines.push('⚠️ Temporarily closed');\n    const block = lines.join('\\n') + '\\n\\n';\n    if (chunk && chunk.length + block.length > MAX_LEN) {\n      out.push({ json: { chatId, text: chunk.trim() } });\n      chunk = '';\n    }\n    chunk += block;\n  });\n  if (chunk.trim()) out.push({ json: { chatId, text: chunk.trim() } });\n}\nreturn out;\n"
+      },
+      "id": "8317033b-548d-4173-b402-2c3ae186e5d8",
+      "name": "Clean, dedupe & format",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1220,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "d80a2b5d-d68a-441e-9b1d-af7dcd70a103",
+      "name": "Send leads",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1460,
+        -120
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "989d34c6-b580-43cc-aabb-eb6698881b57",
+              "leftValue": "={{ $json.csv_base64 || '' }}",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              },
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b27d8998-fcb8-4df0-8d68-c944466d8397",
+      "name": "Has CSV?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1220,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "toBinary",
+        "sourceProperty": "csv_base64",
+        "binaryPropertyName": "data",
+        "options": {
+          "fileName": "={{ $json.csv_filename }}",
+          "mimeType": "text/csv"
+        }
+      },
+      "id": "a10fcaa1-10e7-4b4d-bc02-fa3152590f99",
+      "name": "CSV to file",
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendDocument",
+        "chatId": "={{ $('Scrape Google Maps').item.json.meta.chat_id }}",
+        "binaryData": true,
+        "binaryPropertyName": "data",
+        "additionalFields": {
+          "caption": "=📎 {{ $('Scrape Google Maps').item.json.count }} leads · {{ $('Scrape Google Maps').item.json.search }}"
+        }
+      },
+      "id": "80ef9fa8-fa9c-481f-bfe6-84db9ab83e29",
+      "name": "Send CSV",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1700,
+        80
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Valid request?').item.json.chatId }}",
+        "text": "=❌ Scrape failed for \"{{ $('Valid request?').item.json.search }}\"\n\n{{ String(($json.error && ($json.error.description || $json.error.message)) || JSON.stringify($json)).slice(0, 800) }}\n\nCheck: docker compose logs scraper",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "cb7dc04c-077b-4793-9511-013ac2152876",
+      "name": "Report scrape error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1220,
+        280
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL",
+          "name": "Telegram Bot"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Telegram command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger (weekdays 09:00)": {
+      "main": [
+        [
+          {
+            "node": "Build scheduled jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Telegram command": {
+      "main": [
+        [
+          {
+            "node": "Valid request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build scheduled jobs": {
+      "main": [
+        [
+          {
+            "node": "Valid request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid request?": {
+      "main": [
+        [
+          {
+            "node": "Send 'searching' message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Reply with help / error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send 'searching' message": {
+      "main": [
+        [
+          {
+            "node": "Scrape Google Maps",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Scrape Google Maps": {
+      "main": [
+        [
+          {
+            "node": "Clean, dedupe & format",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Has CSV?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Report scrape error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean, dedupe & format": {
+      "main": [
+        [
+          {
+            "node": "Send leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has CSV?": {
+      "main": [
+        [
+          {
+            "node": "CSV to file",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "CSV to file": {
+      "main": [
+        [
+          {
+            "node": "Send CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  },
+  "pinData": {},
+  "active": false
+}

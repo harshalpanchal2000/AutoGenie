@@ -1,0 +1,80 @@
+# AutoGenie – self-hosted Google Maps lead generation (n8n + Telegram)
+#
+#   caddy   -> public HTTPS reverse proxy for n8n (Telegram webhooks need HTTPS)
+#   n8n     -> workflow engine (Telegram trigger, schedule, cleaning, sending)
+#   scraper -> Python + Playwright headless Chromium; only reachable inside
+#              the Docker network (n8n calls http://scraper:8000)
+#
+# Usage:  cp .env.example .env  &&  edit .env  &&  docker compose up -d --build
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - N8N_DOMAIN=${N8N_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - n8n
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION:-latest}
+    restart: unless-stopped
+    # Bound to localhost only; the public entrypoint is Caddy.
+    # (Handy for an SSH tunnel: ssh -L 5678:localhost:5678 you@vps)
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      - N8N_HOST=${N8N_DOMAIN}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - WEBHOOK_URL=https://${N8N_DOMAIN}/
+      - N8N_PROXY_HOPS=1
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=${TZ:-UTC}
+      - TZ=${TZ:-UTC}
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+      - N8N_RUNNERS_ENABLED=true
+      # The workflow reads its config from these env vars via $env.
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      - SCRAPER_URL=http://scraper:8000
+      - SCRAPER_API_KEY=${SCRAPER_API_KEY}
+      - TELEGRAM_ALLOWED_CHAT_IDS=${TELEGRAM_ALLOWED_CHAT_IDS}
+      - SCHEDULE_CHAT_ID=${SCHEDULE_CHAT_ID}
+      - SCHEDULED_JOBS=${SCHEDULED_JOBS}
+      - DEFAULT_LEAD_LIMIT=${DEFAULT_LEAD_LIMIT:-20}
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      - scraper
+
+  scraper:
+    build: ./scraper
+    restart: unless-stopped
+    init: true
+    shm_size: "1gb"          # Chromium needs more than Docker's 64MB default
+    environment:
+      - SCRAPER_API_KEY=${SCRAPER_API_KEY}
+      - SCRAPER_DB_PATH=/data/leads.db
+      - SCRAPER_CONCURRENCY=${SCRAPER_CONCURRENCY:-3}
+      - SCRAPER_MAX_LIMIT=${SCRAPER_MAX_LIMIT:-100}
+      - SCRAPER_LANG=${SCRAPER_LANG:-en}
+      - SCRAPER_PROXY=${SCRAPER_PROXY:-}
+    volumes:
+      - scraper_data:/data
+    # Not published to the host. For manual testing uncomment:
+    # ports:
+    #   - "127.0.0.1:8000:8000"
+
+volumes:
+  caddy_data:
+  caddy_config:
+  n8n_data:
+  scraper_data:

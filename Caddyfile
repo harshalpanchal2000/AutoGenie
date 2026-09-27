@@ -1,0 +1,6 @@
+# Caddy obtains and renews a free Let's Encrypt certificate automatically.
+# N8N_DOMAIN must point (DNS A record) to this VPS before first start.
+{$N8N_DOMAIN} {
+	encode gzip
+	reverse_proxy n8n:5678
+}
